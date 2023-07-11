@@ -1,0 +1,1099 @@
+diff -rupN ../sdcc-code-13350_mos6502_underscored_areas/sdcc/sdas/as6500/r65mch.c sdas/as6500/r65mch.c
+--- ../sdcc-code-13350_mos6502_underscored_areas/sdcc/sdas/as6500/r65mch.c	2023-05-15 01:02:34.508688000 +0100
++++ sdas/as6500/r65mch.c	2023-05-15 01:02:41.588688000 +0100
+@@ -686,6 +686,11 @@ minit()
+ 	hilo = 0;
+ 
+ 	/*
++	 * Address Space
++	 */
++	exprmasks(3);
++
++	/*
+ 	 * Zero Page Area Pointer
+ 	 */
+ 	zpg = NULL;
+diff -rupN ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/mos6502/gen.c src/mos6502/gen.c
+--- ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/mos6502/gen.c	2023-05-15 01:02:32.858688000 +0100
++++ src/mos6502/gen.c	2023-05-15 01:02:39.788688000 +0100
+@@ -4446,6 +4446,69 @@ genSend (set *sendSet)
+     }
+ }
+ 
++// From z80/gen.c
++static void
++_tidyUp (char *buf)
++{
++  /* Clean up the line so that it is 'prettier' */
++  /* If it is a label - can't do anything */
++  if (!strchr (buf, ':'))
++    {
++      /* Change the first (and probably only) ' ' to a tab so
++         everything lines up.
++       */
++      while (*buf)
++        {
++          if (*buf == ' ')
++            {
++              *buf = '\t';
++              break;
++            }
++          buf++;
++        }
++    }
++}
++
++static void
++_vemit2 (const char *szFormat, va_list ap)
++{
++  struct dbuf_s dbuf;
++  char *buffer, *p, *nextp;
++
++  dbuf_init (&dbuf, INITIAL_INLINEASM);
++
++  dbuf_tvprintf (&dbuf, szFormat, ap);
++
++  buffer = p = dbuf_detach_c_str (&dbuf);
++
++  _tidyUp (p);
++
++  /* Decompose multiline macros */
++  while ((nextp = strchr (p, '\n')))
++    {
++      *nextp = '\0';
++      emit_raw (p);
++      p = nextp + 1;
++    }
++
++  emit_raw (p);
++
++  dbuf_free (buffer);
++}
++
++static void
++emit2 (const char *szFormat, ...)
++{
++  if (!regalloc_dry_run)
++    {
++      va_list ap;
++
++      va_start (ap, szFormat);
++      _vemit2 (szFormat, ap);
++      va_end (ap);
++    }
++}
++
+ /**************************************************************************
+  * genCall - generates a call statement
+  *************************************************************************/
+@@ -4492,9 +4555,18 @@ genCall (iCode * ic)
+   else
+     {
+       bool jump = (!ic->parmBytes && IFFUNC_ISNORETURN (OP_SYMBOL (left)->type));
+-
+-      emit6502op (jump ? "jmp" : "jsr", "%s", (OP_SYMBOL (left)->rname[0] ?
+-                              OP_SYMBOL (left)->rname : OP_SYMBOL (left)->name));
++      if (IFFUNC_ISBANKEDCALL (dtype) && !jump)
++        {
++          char *name = OP_SYMBOL (IC_LEFT (ic))->rname[0] ? OP_SYMBOL (IC_LEFT (ic))->rname : OP_SYMBOL (IC_LEFT (ic))->name;
++          emit2 ("jsr ___sdcc_bcall");
++          emit2 ("!db !bankimmeds", name);
++          emitcode (".dw ", "%s-1", name);
++        }
++      else
++        {
++          emit6502op (jump ? "jmp" : "jsr", "%s", (OP_SYMBOL (left)->rname[0] ?
++                                  OP_SYMBOL (left)->rname : OP_SYMBOL (left)->name));
++        }
+     }
+ 
+   m6502_dirtyReg (m6502_reg_a);
+@@ -4694,6 +4766,20 @@ genFunction (iCode * ic)
+   emitComment (ALWAYS, m6502_assignment_optimal ? "Register assignment is optimal." : "Register assignment might be sub-optimal.");
+   emitComment (ALWAYS, "Stack space usage: %d bytes.", sym->stack);
+ 
++  if (IFFUNC_BANKED (sym->type))
++    {
++      int bank_number = 0;
++      for (int i  = strlen (options.code_seg)-1; i >= 0; i--)
++        {
++          if (!isdigit (options.code_seg[i]) && options.code_seg[i+1] != '\0')
++            {
++              bank_number = atoi (&options.code_seg[i+1]);
++              break;
++            }
++        }
++      emit2("!bequ", sym->rname, bank_number);
++    }
++
+   emitcode ("", "%s:", sym->rname);
+   genLine.lineCurr->isLabel = 1;
+   ftype = operandType (IC_LEFT (ic));
+diff -rupN ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/mos6502/main.c src/mos6502/main.c
+--- ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/mos6502/main.c	2023-05-15 01:02:32.848688000 +0100
++++ src/mos6502/main.c	2023-05-15 01:02:39.788688000 +0100
+@@ -34,6 +34,7 @@
+ #include "dbuf_string.h"
+ #include "m6502.h"
+ 
++#define OPTION_BO               "-bo"
+ #define OPTION_SMALL_MODEL          "--model-small"
+ #define OPTION_LARGE_MODEL          "--model-large"
+ //#define OPTION_CODE_SEG        "--codeseg"
+@@ -83,6 +84,8 @@ static char *m6502_keywords[] = {
+   "at",
+   "critical",
+   "interrupt",
++  "nonbanked",
++  "banked",
+   "naked",
+   "reentrant",
+   "code",
+@@ -154,10 +157,146 @@ m6502_regparm (sym_link *l, bool reentra
+   return 1+_G.regparam.n-size;
+ }
+ 
++enum
++{
++  P_BANK = 1,
++  P_PORTMODE,
++  P_CODESEG,
++  P_CONSTSEG,
++};
++
++static int
++do_pragma (int id, const char *name, const char *cp)
++{
++  struct pragma_token_s token;
++  int err = 0;
++  int processed = 1;
++
++  init_pragma_token (&token);
++
++  switch (id)
++    {
++    case P_BANK:
++      {
++        struct dbuf_s buffer;
++
++        dbuf_init (&buffer, 128);
++
++        cp = get_pragma_token (cp, &token);
++
++        switch (token.type)
++          {
++          case TOKEN_EOL:
++            err = 1;
++            break;
++
++          case TOKEN_INT:
++            dbuf_printf (&buffer, "CODE_%d", token.val.int_val);
++            break;
++
++          default:
++            {
++              const char *str = get_pragma_string (&token);
++
++              dbuf_append_str (&buffer, (0 == strcmp ("BASE", str)) ? "HOME" : str);
++            }
++            break;
++          }
++
++        cp = get_pragma_token (cp, &token);
++        if (TOKEN_EOL != token.type)
++          {
++            err = 1;
++            break;
++          }
++
++        dbuf_c_str (&buffer);
++        options.code_seg = (char *) dbuf_detach (&buffer);
++      }
++      break;
++
++    case P_CODESEG:
++    case P_CONSTSEG:
++      {
++        char *segname;
++
++        cp = get_pragma_token (cp, &token);
++        if (token.type == TOKEN_EOL)
++          {
++            err = 1;
++            break;
++          }
++
++        segname = Safe_strdup (get_pragma_string (&token));
++
++        cp = get_pragma_token (cp, &token);
++        if (token.type != TOKEN_EOL)
++          {
++            Safe_free (segname);
++            err = 1;
++            break;
++          }
++
++        if (id == P_CODESEG)
++          {
++            if (options.code_seg)
++              Safe_free (options.code_seg);
++            options.code_seg = segname;
++          }
++        else
++          {
++            if (options.const_seg)
++              Safe_free (options.const_seg);
++            options.const_seg = segname;
++          }
++      }
++      break;
++
++    default:
++      processed = 0;
++      break;
++    }
++
++  get_pragma_token (cp, &token);
++
++  if (1 == err)
++    werror (W_BAD_PRAGMA_ARGUMENTS, name);
++
++  free_pragma_token (&token);
++  return processed;
++}
++
++static struct pragma_s pragma_tbl[] = {
++  {"bank", P_BANK, 0, do_pragma},
++  {"codeseg", P_CODESEG, 0, do_pragma},
++  {"constseg", P_CONSTSEG, 0, do_pragma},
++  {NULL, 0, 0, NULL},
++};
++
++static int
++_process_pragma (const char *s)
++{
++  return process_pragma_tbl (pragma_tbl, s);
++}
++
+ static bool
+ m6502_parseOptions (int *pargc, char **argv, int *i)
+ {
+-  return false;
++    if (argv[*i][0] == '-')
++    {
++        if (!strncmp (argv[*i], OPTION_BO, sizeof (OPTION_BO) - 1))
++        {
++            /* ROM bank */
++            int bank = getIntArg (OPTION_BO, argv, i, *pargc);
++            struct dbuf_s buffer;
++            dbuf_init (&buffer, 16);
++            dbuf_printf (&buffer, "CODE_%u", bank);
++            dbuf_c_str (&buffer);
++            options.code_seg = (char *) dbuf_detach (&buffer);
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ static void
+@@ -699,7 +838,7 @@ PORT mos6502_port =
+     "HOME",               /* home */
+     "DATA",               /* initialized xdata */
+     "XINIT",              /* a code copy of xiseg */
+-    "RODATA",             /* const_name */
++    NULL,                 /* const_name */
+     "CABS    (ABS)",      /* cabs_name - const absolute data */
+     "DABS    (ABS)",      /* xabs_name - absolute xdata */
+     NULL,                 /* iabs_name */
+@@ -765,7 +904,7 @@ PORT mos6502_port =
+   0,                            /* genInitStartup */
+   m6502_reset_regparm,
+   m6502_regparm,
+-  NULL,                         /* process_pragma */
++  _process_pragma,              /* process_pragma */
+   NULL,                         /* getMangledFunctionName */
+   _hasNativeMulFor,             /* hasNativeMulFor */
+   hasExtBitOp,                  /* hasExtBitOp */
+@@ -857,7 +996,7 @@ PORT mos65c02_port =
+     "HOME",               // home
+     "DATA",               // initialized xdata
+     "XINIT",              // a code copy of xiseg
+-    "RODATA",             // const_name - const data (code or not)
++    NULL,                 // const_name - const data (code or not)
+     "CABS    (ABS)",      // cabs_name - const absolute data (code or not)
+     "DABS    (ABS)",      // xabs_name - absolute xdata
+     NULL,                 // iabs_name - absolute data
+@@ -922,7 +1061,7 @@ PORT mos65c02_port =
+   0,                            /* genInitStartup */
+   m6502_reset_regparm,
+   m6502_regparm,
+-  0,                            /* process_pragma */
++  _process_pragma,              /* process_pragma */
+   NULL,                         /* getMangledFunctionName */
+   _hasNativeMulFor,             /* hasNativeMulFor */
+   hasExtBitOp,                  /* hasExtBitOp */
+diff -rupN ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/SDCCglue.c src/SDCCglue.c
+--- ../sdcc-code-13350_mos6502_underscored_areas/sdcc/src/SDCCglue.c	2023-05-15 01:02:32.868688000 +0100
++++ src/SDCCglue.c	2023-05-15 01:02:39.798688000 +0100
+@@ -2129,7 +2129,7 @@ printPublics (FILE * afile)
+ 
+   for (sym = setFirstItem (publics); sym; sym = setNextItem (publics))
+     {
+-      if (TARGET_Z80_LIKE && IFFUNC_BANKED(sym->type))
++      if (IFFUNC_BANKED(sym->type))
+         {
+           /* TODO: use template for bank symbol generation */
+           sprintf (buffer, "b%s", sym->rname);
+Index: device/lib/mos6502/__memcpy.s
+===================================================================
+--- device/lib/mos6502/__memcpy.s	(revision 13350)
++++ device/lib/mos6502/__memcpy.s	(working copy)
+@@ -57,7 +57,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ ___memcpy:
+ 	sta	*save+0
+Index: device/lib/mos6502/__sdcc_indirect_jsr.s
+===================================================================
+--- device/lib/mos6502/__sdcc_indirect_jsr.s	(revision 13350)
++++ device/lib/mos6502/__sdcc_indirect_jsr.s	(working copy)
+@@ -1,3 +1,3 @@
+-.area CODE
++.area _CODE
+ __sdcc_indirect_jsr::
+ 	jmp	[__TEMP]
+Index: device/lib/mos6502/_divsint.s
+===================================================================
+--- device/lib/mos6502/_divsint.s	(revision 13350)
++++ device/lib/mos6502/_divsint.s	(working copy)
+@@ -47,7 +47,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ __divsint:
+ 	jsr	___sdivmod16
+Index: device/lib/mos6502/_divslong.s
+===================================================================
+--- device/lib/mos6502/_divslong.s	(revision 13350)
++++ device/lib/mos6502/_divslong.s	(working copy)
+@@ -50,7 +50,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ __divslong:
+ 	jsr	___sdivmod32
+ 	lda	*s1
+Index: device/lib/mos6502/_divulong.s
+===================================================================
+--- device/lib/mos6502/_divulong.s	(revision 13350)
++++ device/lib/mos6502/_divulong.s	(working copy)
+@@ -73,7 +73,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ __divulong:
+ 	jsr	___udivmod32
+Index: device/lib/mos6502/_modsint.s
+===================================================================
+--- device/lib/mos6502/_modsint.s	(revision 13350)
++++ device/lib/mos6502/_modsint.s	(working copy)
+@@ -46,7 +46,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ __modsint:
+ 	jsr 	___sdivmod16
+Index: device/lib/mos6502/_modslong.s
+===================================================================
+--- device/lib/mos6502/_modslong.s	(revision 13350)
++++ device/lib/mos6502/_modslong.s	(working copy)
+@@ -49,7 +49,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ __modslong:
+ 	jsr	___sdivmod32
+ 	lda	*s1
+Index: device/lib/mos6502/_moduint.s
+===================================================================
+--- device/lib/mos6502/_moduint.s	(revision 13350)
++++ device/lib/mos6502/_moduint.s	(working copy)
+@@ -45,7 +45,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 	
+ __moduint:
+ 	jsr 	___udivmod16
+Index: device/lib/mos6502/_mulschar.s
+===================================================================
+--- device/lib/mos6502/_mulschar.s	(revision 13350)
++++ device/lib/mos6502/_mulschar.s	(working copy)
+@@ -52,7 +52,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ __mulschar:
+ 	sta	s1
+Index: device/lib/mos6502/_muluchar.s
+===================================================================
+--- device/lib/mos6502/_muluchar.s	(revision 13350)
++++ device/lib/mos6502/_muluchar.s	(working copy)
+@@ -49,7 +49,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ __muluchar:
+ 	sta     arg1
+Index: device/lib/mos6502/_strcmp.s
+===================================================================
+--- device/lib/mos6502/_strcmp.s	(revision 13350)
++++ device/lib/mos6502/_strcmp.s	(working copy)
+@@ -50,7 +50,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ _strcmp:
+ 	sta	*_str1+0
+Index: device/lib/mos6502/_strcpy.s
+===================================================================
+--- device/lib/mos6502/_strcpy.s	(revision 13350)
++++ device/lib/mos6502/_strcpy.s	(working copy)
+@@ -51,7 +51,7 @@
+ ;--------------------------------------------------------
+ ; code
+ ;--------------------------------------------------------
+-	.area CODE
++	.area _CODE
+ 
+ _strcpy:
+ 	sta	*_dst+0
+Index: device/lib/mos6502/crt0.s
+===================================================================
+--- device/lib/mos6502/crt0.s	(revision 13350)
++++ device/lib/mos6502/crt0.s	(working copy)
+@@ -30,17 +30,17 @@
+ 
+ 	;; Ordering of segments for the linker.
+         .area _CODE
+-        .area GSINIT
+-        .area GSFINAL
+-        .area CODE
+-        .area RODATA
+-        .area XINIT
++        .area _GSINIT
++        .area _GSFINAL
++        .area _CODE
++        .area _RODATA
++        .area _XINIT
+ 
+ 	.area _DATA
+-        .area DATA
+-        .area BSS
++        .area _DATA
++        .area _BSS
+ 
+-        .area ZP      (PAG)
++        .area _ZP      (PAG)
+         .area OSEG    (PAG, OVR)
+ 
+ 	;; Reset/interrupt vectors
+@@ -50,7 +50,7 @@
+ 	.dw	__sdcc_gs_init_startup ; RESET
+ 	.dw	__sdcc_gs_init_startup ; IRQ/BRK
+ 
+-        .area GSINIT
++        .area _GSINIT
+ __sdcc_gs_init_startup:
+         ldx     #0xff
+         txs
+@@ -59,30 +59,30 @@
+ 
+ __sdcc_init_data:
+ ;; initialize DATA
+-        lda #<s_XINIT
++        lda #<s__XINIT
+         sta *___memcpy_PARM_2
+-        lda #>s_XINIT
++        lda #>s__XINIT
+         sta *___memcpy_PARM_2+1
+-        lda #<l_XINIT
++        lda #<l__XINIT
+         sta *___memcpy_PARM_3
+-        lda #>l_XINIT
++        lda #>l__XINIT
+         sta *___memcpy_PARM_3+1
+-        lda #<s_DATA
+-        ldx #>s_DATA
++        lda #<s__DATA
++        ldx #>s__DATA
+         jsr ___memcpy
+ 
+ ;; clear BSS
+         lda #0x00
+         sta *_memset_PARM_2
+-        lda #<l_BSS
++        lda #<l__BSS
+         sta *_memset_PARM_3
+-        lda #>l_BSS
++        lda #>l__BSS
+         sta *_memset_PARM_3+1
+-        lda #<s_BSS
+-        ldx #>s_BSS
++        lda #<s__BSS
++        ldx #>s__BSS
+         jsr _memset
+ 
+-        .area GSFINAL
++        .area _GSFINAL
+ __sdcc_program_startup:
+         jsr     _main
+         jmp     .
+Index: device/lib/mos6502-stack-auto/__sdcc_indirect_jsr.s
+===================================================================
+--- device/lib/mos6502-stack-auto/__sdcc_indirect_jsr.s	(revision 13350)
++++ device/lib/mos6502-stack-auto/__sdcc_indirect_jsr.s	(working copy)
+@@ -1,3 +1,3 @@
+-.area CODE
++.area _CODE
+ __sdcc_indirect_jsr::
+ 	jmp	[__TEMP]
+Index: device/lib/mos6502-stack-auto/crt0.s
+===================================================================
+--- device/lib/mos6502-stack-auto/crt0.s	(revision 13350)
++++ device/lib/mos6502-stack-auto/crt0.s	(working copy)
+@@ -30,18 +30,18 @@
+ 
+ 	;; Ordering of segments for the linker.
+         .area _CODE
+-        .area GSINIT
+-        .area GSFINAL
+-        .area CODE
+-        .area RODATA
+-        .area XINIT
++        .area _GSINIT
++        .area _GSFINAL
++        .area _CODE
++        .area _RODATA
++        .area _XINIT
+ 
+-        .area ZP      (PAG)
++        .area _ZP      (PAG)
+         .area OSEG    (PAG, OVR)
+ 
+ 	.area _DATA
+-        .area DATA
+-        .area BSS
++        .area _DATA
++        .area _BSS
+ 
+ 	;; Reset/interrupt vectors
+         .area   CODEIVT (ABS)
+@@ -50,7 +50,7 @@
+ 	.dw	__sdcc_gs_init_startup ; RESET
+ 	.dw	__sdcc_gs_init_startup ; IRQ/BRK
+ 
+-        .area GSINIT
++        .area _GSINIT
+ __sdcc_gs_init_startup:
+         ldx     #0xff
+         txs
+@@ -59,18 +59,18 @@
+ 
+ __sdcc_init_data:
+ ;; initialize DATA
+-        lda #>l_XINIT
++        lda #>l__XINIT
+         pha
+-        lda #<l_XINIT
++        lda #<l__XINIT
+         pha
+ 
+-        lda #>s_XINIT
++        lda #>s__XINIT
+         pha
+-        lda #<s_XINIT
++        lda #<s__XINIT
+         pha
+ 
+-        lda #<s_DATA
+-        ldx #>s_DATA
++        lda #<s__DATA
++        ldx #>s__DATA
+         jsr ___memcpy
+ 	pla
+ 	pla
+@@ -78,18 +78,18 @@
+ 	pla
+ 
+ ;; clear BSS
+-        lda #>l_BSS
++        lda #>l__BSS
+         pha
+-        lda #<l_BSS
++        lda #<l__BSS
+         pha
+ 
+         lda #0x00
+         pha
+-        lda #<s_BSS
+-        ldx #>s_BSS
++        lda #<s__BSS
++        ldx #>s__BSS
+         jsr _memset
+ 
+-        .area GSFINAL
++        .area _GSFINAL
+ __sdcc_program_startup:
+         jsr     _main
+         jmp     .
+Index: src/SDCCasm.c
+===================================================================
+--- src/SDCCasm.c	(revision 13350)
++++ src/SDCCasm.c	(working copy)
+@@ -408,10 +408,10 @@
+   {"immed", "#"},
+   {"zero", "#0x00"},
+   {"one", "#0x01"},
+-  {"area", ".area %s"},
+-  {"areacode", ".area %s"},
+-  {"areadata", ".area %s"},
+-  {"areahome", ".area %s"},
++  {"area", ".area _%s"},
++  {"areacode", ".area _%s"},
++  {"areadata", ".area _%s"},
++  {"areahome", ".area _%s"},
+   {"ascii", ".ascii \"%s\""},
+   {"ds", ".ds %d"},
+   {"db", ".db"},
+Index: src/mos6502/main.c
+===================================================================
+--- src/mos6502/main.c	(revision 13350)
++++ src/mos6502/main.c	(working copy)
+@@ -217,7 +217,7 @@
+       fprintf (of, "\t.globl __TEMP\n");
+       fprintf (of, "\t.globl __DPTR\n");
+       
+-      fprintf (of, "\t.area %s\n",port->mem.data_name);
++      fprintf (of, "\t.area _%s\n",port->mem.data_name);
+       fprintf (of, "__TEMP:\t.ds %d\n", NUM_TEMP_REGS);
+       fprintf (of, "__DPTR:\t.ds 2\n");
+     }
+@@ -696,7 +696,7 @@
+     "GSINIT",             /* static initialization */
+     "OSEG    (PAG, OVR)", /* overlay */
+     "GSFINAL",            /* gsfinal */
+-    "_CODE",              /* home */
++    "HOME",               /* home */
+     "DATA",               /* initialized xdata */
+     "XINIT",              /* a code copy of xiseg */
+     "RODATA",             /* const_name */
+@@ -854,7 +854,7 @@
+     "GSINIT",             // static initialization
+     "OSEG    (PAG, OVR)", // overlay
+     "GSFINAL",            // gsfinal
+-    "_CODE",              // home
++    "HOME",               // home
+     "DATA",               // initialized xdata
+     "XINIT",              // a code copy of xiseg
+     "RODATA",             // const_name - const data (code or not)
+Index: sdas/linksrc/lkmem.c
+===================================================================
+--- sdas/linksrc/lkmem.c	(revision 14068)
++++ sdas/linksrc/lkmem.c	(working copy)
+@@ -44,7 +44,8 @@
+ 
+     char buff[128];
+     int j, toreturn=0;
+-    unsigned int Total_Last=0, k;
++    unsigned int Total_Last=0;
++    int k;
+ 
+     struct area * xp;
+     FILE * of;
+@@ -274,7 +275,7 @@
+ 
+     /*Compute the amount of unused memory in direct data Ram.  This is the
+     gap between the last register bank or bit segment and the data segment.*/
+-    for(k=Ram[6].Start-1; (dram[k]==0) && (k>0); k--);
++    for(k=Ram[6].Start-1; (k>0) && (dram[k]==0); k--);
+     Ram[5].Start=k+1;
+     Ram[5].Size=Ram[6].Start-Ram[5].Start; /*It may be zero (which is good!)*/
+ 
+diff -rupN ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/aslink.h sdas/linksrc/aslink.h
+--- ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/aslink.h	2023-05-08 16:56:16.771748400 +0100
++++ sdas/linksrc/aslink.h	2023-05-08 19:36:52.401748400 +0100
+@@ -374,6 +374,16 @@ extern  int     ASxxxx_VERSION;
+                                  */
+ /* end sdld specific */
+ 
++/* Options for platform specific virtual address translation
++*
++*
++*/
++#define PLATFORM_NONE         0      /* Default address handling */
++#define PLATFORM_SMS          1      /* SMS/GG specific virtual address handling */
++#define PLATFORM_NES          2      /* NES/Famicom specific virtual address handling */
++
++#define PLATFORM_SMS_STR      "sms"
++#define PLATFORM_NES_STR      "nes"
+ 
+ /*
+  *      ASLINK - Version 4 Definitions
+@@ -1037,6 +1047,8 @@ extern  int     pflag;          /*
+                                  */
+ extern  int     uflag;          /*      Listing relocation flag
+                                  */
++extern  int     platform;       /*      Select platform specific virtual address translation
++                                 */
+ extern  int     wflag;          /*      Enable wide format listing
+                                  */
+ extern  int     zflag;          /*      Disable symbol case sensitivity
+@@ -1158,6 +1170,7 @@ extern  FILE *          afile(char *fn,
+ extern  VOID            bassav(void);
+ extern  int             fndidx(char *str);
+ extern  int             fndext(char *str);
++extern  VOID            platset(void);
+ extern  VOID            gblsav(void);
+ extern  int             intsiz(void);
+ extern  VOID            iramsav(void);
+diff -rupN ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkarea.c sdas/linksrc/lkarea.c
+--- ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkarea.c	2023-05-08 16:56:16.771748400 +0100
++++ sdas/linksrc/lkarea.c	2023-05-15 00:52:49.148688000 +0100
+@@ -321,6 +321,8 @@ lkparea(char *id)
+  *                                      area structure
+  *              area    *areap          The pointer to the first
+  *                                      area structure of a linked list
++ *              int     platform        selects platform specific
++ *                                      virtual address translation
+  *
+  *      functions called:
+  *              int     fprintf()       c_library
+@@ -424,6 +426,30 @@ lnkarea(void)
+                                 ap->a_addr = (atoi(ap->a_id+6) << 16) + 0xA000;
+                         }
+                 }
++                // Z80 sms/gg virtual address / mapper handling
++                if (TARGET_IS_Z80 && (platform == PLATFORM_SMS) && ap->a_addr == 0) {
++                        // Standard sega sms/gg mapper used by most
++                        if (!strncmp(ap->a_id, "_CODE_", 6) && atoi(ap->a_id+6)!=0) {
++                                ap->a_addr = (atoi(ap->a_id+6) << 16) + 0x4000;
++                        }
++                        if (!strncmp(ap->a_id, "_LIT_", 5) && atoi(ap->a_id+5)!=0) {
++                                ap->a_addr = (atoi(ap->a_id+5) << 16) + 0x8000;
++                        }
++                        if (!strncmp(ap->a_id, "_DATA_", 6)) {
++                                // set sane default values for ram banking
++                                ap->a_addr = (atoi(ap->a_id+6) << 16) + 0x8000;
++                        }
++                }
++                if((platform == PLATFORM_NES) && ap->a_addr == 0) {
++                        if(!strncmp(ap->a_id, "_CODE_", 6)) {
++                                // set sane default values for rom banking
++                                // 0x8000 is correct for most NES mappers with 
++                                // 16kB switching, such as UNROM.
++                                ap->a_addr = (atoi(ap->a_id+6) << 16) + 0x8000;
++                                // Set this to prevent further odd & unexpected relocation further down
++                                ap->a_bset = 1;
++                        }
++                }
+                 if (ap->a_flag & A3_ABS) {
+                         /*
+                          * Absolute sections
+@@ -449,7 +475,9 @@ lnkarea(void)
+                          */
+                         if (!is_sdld() || TARGET_IS_Z80 || TARGET_IS_Z180 || TARGET_IS_GB) {
+                                 if (ap->a_addr == 0)
++                                {
+                                         ap->a_addr = rloc[locIndex];
++                                }
+                         }
+                         else if (ap->a_bset == 0) {
+                                 if ((TARGET_IS_6808 || TARGET_IS_STM8) && ap->a_flag & A_NOLOAD) {
+diff -rupN ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkdata.c sdas/linksrc/lkdata.c
+--- ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkdata.c	2023-05-08 16:56:16.771748400 +0100
++++ sdas/linksrc/lkdata.c	2023-05-08 19:34:51.141748400 +0100
+@@ -84,6 +84,8 @@ int     pflag;          /*      print li
+                          */
+ int     uflag;          /*      Listing relocation flag
+                          */
++int     platform;       /*      Select platform specific virtual address translation
++                         */
+ int     wflag;          /*      Enable wide format listing
+                          */
+ int     zflag;          /*      Disable symbol case sensitivity
+@@ -148,6 +150,8 @@ int     gcntr;          /*      LST file
+ /* sdld specific */
+ char    *optsdcc;
+ char    *optsdcc_module;
++int     platform = PLATFORM_NONE; /* Select platform specific virtual address translation
++                         */
+ int     sflag;          /*      JCF: Memory usage output flag
+                          */
+ int     stacksize=0;    /*      JCF: Stack size
+diff -rupN ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkmain.c sdas/linksrc/lkmain.c
+--- ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkmain.c	2023-05-08 16:56:16.771748400 +0100
++++ sdas/linksrc/lkmain.c	2023-05-08 19:49:37.781748400 +0100
+@@ -226,6 +226,10 @@ main(int argc, char *argv[])
+                                 /*
+                                  * Options with arguments
+                                  */
++                                case 'a':
++                                case 'A':
++                                        pflag = 0;
++
+                                 case 'b':
+                                 case 'B':
+ 
+@@ -248,7 +252,7 @@ main(int argc, char *argv[])
+                                         strcat(ip, " ");
+                                         if (i < argc - 1)
+                                                 strcat(ip, argv[++i]);
+-					else
++					                    else
+                                                 strcpy(ip, "");
+                                         break;
+                                 /*
+@@ -904,6 +908,7 @@ map(void)
+  *              int     oflag           Output file type flag
+  *              int     objflg          Linked file/library output object flag
+  *              int     pflag           print linker command file flag
++ *              int     platform        Selects platform specific virtual address translation
+  *              FILE *  stderr          c_library
+  *              int     uflag           Relocated listing flag
+  *              int     xflag           Map file radix type flag
+@@ -913,6 +918,7 @@ map(void)
+  *      Functions called:
+  *              VOID    addlib()        lklibr.c
+  *              VOID    addpath()       lklibr.c
++ *              VOID    platset()       lkmain.c
+  *              VOID    bassav()        lkmain.c
+  *              VOID    doparse()       lkmain.c
+  *              int     fprintf()       c_library
+@@ -946,6 +952,13 @@ parse()
+                         while (ctype[c=get()] & LETTER) {
+                                 switch(c) {
+ 
++                                case 'a':
++                                case 'A':
++                                        if (is_sdld()) {
++                                            platset();
++                                        }
++                                        return(0);
++
+                                 case 'C':
+                                         if (is_sdld() && !(TARGET_IS_Z80 || TARGET_IS_GB)) {
+                                                 codesav();
+@@ -1227,6 +1240,47 @@ doparse()
+         startp->f_type = 0;
+ }
+ 
++/*)Function     VOID    platset()
++ *
++ *      The function platset() sets variable which stores platform
++ *      specific virtual address translation.
++ *
++ *      local variables:
++ *              none
++ *
++ *      global variables:
++ *              int     platform        selects platform specific
++ *                                      virtual address translation
++ *              char    *ip             pointer into the REL file
++ *                                      text line in ib[]
++ *
++ *       functions called:
++ *              int     fprintf()       c_library
++ *              int     getnb()         lklex.c
++ *              int     strcmp()        c_library
++ *              VOID    unget()         lklex.c
++ *
++ *      side effects:
++ *              The basep structure is created.
++ */
++
++VOID
++platset()
++{
++        unget(getnb());
++        if (strcmp(ip, PLATFORM_SMS_STR) == 0) {
++                platform = PLATFORM_SMS;
++                return;
++        }
++        else if (strcmp(ip, PLATFORM_NES_STR) == 0) {
++                platform = PLATFORM_NES;
++                return;
++        }
++        fprintf(stderr,
++        "No matching platform found for: %s\n", ip);
++}
++
++
+ /*)Function     VOID    bassav()
+  *
+  *      The function bassav() creates a linked structure containing
+@@ -1785,6 +1839,7 @@ char *usetxt_6808[] = {
+         "Relocation:",
+         "  -b   area base address = expression",
+         "  -g   global symbol = expression",
++        "  -a   (platform) Select platform specific virtual address translation",
+         "Map format:",
+         "  -m   Map output generated as (out)file[.map]",
+         "  -w   Wide listing format for map file",
+@@ -1831,6 +1886,7 @@ char *usetxt_z80_gb[] = {
+         "Relocation:",
+         "  -b   area base address = expression",
+         "  -g   global symbol = expression",
++        "  -a   (platform) Select platform specific virtual address translation",
+         "Map format:",
+         "  -m   Map output generated as (out)file[.map]",
+         "  -w   Wide listing format for map file",
+diff -rupN ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkout.c sdas/linksrc/lkout.c
+--- ../sdcc-code-13350_mos6502_bank_support/sdcc/sdas/linksrc/lkout.c	2023-05-08 16:56:16.771748400 +0100
++++ sdas/linksrc/lkout.c	2023-05-23 22:55:27.875217000 +0100
+@@ -363,6 +363,8 @@ ixx(int i)
+  *      global variables:
+  *              int     a_bytes         T Line Address Bytes
+  *              FILE *  ofp             output file handle
++ *              int     platform        selects platform specific
++ *                                      virtual address translation
+  *              int     rtaflg          first output flag
+  *              char    rtbuf[]         output buffer
+  *              a_uint  rtadr0          address temporary
+@@ -400,6 +402,31 @@ iflush()
+                         rrtadr0 = (rrtadr0>>16) * 0x4000 + (rrtadr0&0xffff) - 0x4000;
+         }
+ 
++        // translate virtual addresses for sms/gg
++        if(platform == PLATFORM_SMS){
++                if(rrtadr0 >= 0x10000)
++                        rrtadr0 = ((rrtadr0 >> 16) * 0x4000) + (rrtadr0 & 0x3FFF);
++        }
++
++        // translate virtual addresses for NES/Famicom
++        if(platform == PLATFORM_NES){
++                int bank_number;
++                if((rrtadr0 & 0xC000) == 0xC000)
++                {
++                    // Place fixed bank as bank 0 / first bank of ROM for simpler handling
++                    // (.nes file creation will put it as the *last* bank by rotating the ROM file) 
++                    bank_number = 0;
++                    rrtadr0 = (bank_number * 0x4000) + (rrtadr0 & 0x3FFF);
++                }
++                else if((rrtadr0 & 0xC000) == 0x8000)
++                {
++                    // Place switchable bank one bank higher than intended in ROM
++                    // (.nes file creation will relocate it to correct bank by rotating the ROM file)
++                    int bank_number = (rrtadr0 >> 16) + 1;
++                    rrtadr0 = (bank_number * 0x4000) + (rrtadr0 & 0x3FFF);
++                }
++        }
++
+         max = (int) (rtadr1 - rtadr0);
+         if (max) {
+                 if (a_bytes > 2) {
+
+
+
+
+
+
+
+
+
+
+
+
+--- src/mos6502/gen.c.pre-nonbanked-patch	2023-07-09 11:19:33.482433066 -0700
++++ src/mos6502/gen.c	2023-07-09 11:20:22.337936227 -0700
+@@ -73,6 +73,7 @@ static struct
+   int tempOfs;
+   struct attr_t tempAttr[NUM_TEMP_REGS];
+   struct attr_t DPTRAttr[2];
++  bool in_home;
+ } _G;
+ 
+ extern int m6502_ptrRegReq;
+@@ -155,6 +156,33 @@ const int STACK_TOP = 0x100;
+ #define AOP_SIZE(op) AOP(op)->size
+ #define AOP_OP(aop) aop->op
+ 
++/* Duplicated from z80/gen.c */
++/* This is quite unfortunate */
++static void
++setArea (int inHome)
++{
++  /*
++     static int lastArea = 0;
++
++     if (_G.in_home != inHome) {
++     if (inHome) {
++     const char *sz = port->mem.code_name;
++     port->mem.code_name = "HOME";
++     emit2("!area", CODE_NAME);
++     port->mem.code_name = sz;
++     }
++     else
++     emit2("!area", CODE_NAME); */
++  _G.in_home = inHome;
++  //    }
++}
++
++static bool
++isInHome (void)
++{
++  return _G.in_home;
++}
++
+ /**************************************************************************
+  * Returns the cycle count for the instruction
+  *
+@@ -4769,6 +4797,8 @@ genFunction (iCode * ic)
+   int stackAdjust = sym->stack;
+   //  int accIsFree = sym->recvSize == 0;
+ 
++  setArea (IFFUNC_NONBANKED (sym->type));
++
+   /* create the function header */
+   emitComment (ALWAYS, "-----------------------------------------");
+   emitComment (ALWAYS, " function %s", sym->name);
+@@ -11053,6 +11083,11 @@ genm6502Code (iCode *lic)
+   if (!options.nopeep)
+     peepHole (&genLine.lineHead);
+ 
++  /* Duplicated from z80/gen.c */
++  /* This is unfortunate */
++  if (isInHome () && codeOutBuf == &code->oBuf)
++    codeOutBuf = &home->oBuf;
++
+   /* now do the actual printing */
+   printLine (genLine.lineHead, codeOutBuf);
