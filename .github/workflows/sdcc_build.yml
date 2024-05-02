@@ -34,11 +34,7 @@ jobs:
           - os: ubuntu-20.04
             name: Win32-On-Linux
           - os: ubuntu-20.04
-            name: Win64-On-Linux
-          - os: macos-13
-            name: MacOS-x64
-          - os: macos-14
-            name: MacOS-arm64            
+            name: Win64-On-Linux    
     steps:
       # ==== Pre-Build: Set environment vars ====
       # Needs to be in a separate step than build so that setting the environment var takes effect
